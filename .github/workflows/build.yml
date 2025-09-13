@@ -1,0 +1,28 @@
+name: build-dataset
+
+on:
+  push:
+    paths:
+      - "data/raw/**"
+      - "scripts/**"
+      - ".github/workflows/build.yml"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: pip install pandas
+      - name: Build master.csv
+        run: python scripts/parse_shipment.py
+      - name: Commit processed files
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "build: update processed dataset"
+          file_pattern: "data/processed/*"
