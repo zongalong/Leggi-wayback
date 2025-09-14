@@ -1,28 +1,28 @@
 # scripts/parse_shipment.py
 from pathlib import Path
 import pandas as pd
-import csv, re, io, math
+import csv, re, io
 
-RAW = Path("data/raw/SHIPMENT.TXT")  # ajuste si ton nom diffère
+RAW = Path("data/raw/SHIPMENT.TXT")  # ajuste si le nom diffère
 OUTDIR = Path("data/processed")
 OUTDIR.mkdir(parents=True, exist_ok=True)
 OUT_CSV = OUTDIR / "master2.csv"
 OUT_TSV = OUTDIR / "master2.tsv"
+OUT_MIN = OUTDIR / "master_minimal.csv"
 
 ENCODINGS = ["utf-8", "cp1252", "latin-1"]
 
-# --------- utilitaires ---------
+# ---------- helpers ----------
 def read_text_any(path: Path) -> str:
-    last = None
     for enc in ENCODINGS:
         try:
             return path.read_text(encoding=enc, errors="strict")
-        except Exception as e:
-            last = e
+        except Exception:
+            pass
     return path.read_text(encoding="latin-1", errors="ignore")
 
 NUM_RE = re.compile(r"^\s*-?\d+(?:\.\d+)?\s*$")
-DATEF_RE = re.compile(r"^\s*\d{8}(?:\.\d+)?\s*$")  # ex: 19981103.000000
+DATEF_RE = re.compile(r"^\s*\d{8}(?:\.\d+)?\s*$")  # 19981103.000000
 
 def is_num(tok: str) -> bool:
     return bool(NUM_RE.match((tok or "").strip()))
@@ -55,27 +55,22 @@ def to_float(x):
     except Exception:
         return None
 
-# --------- parseur COMMA non-quoté (reconstruit les champs texte) ---------
+# ---------- parse COMMA non-quoted with the confirmed structure ----------
 def parse_line_comma(line: str) -> dict:
     tks = line.rstrip("\n").split(",")
-
     i = 0
-    shipment_no, i         = take(tks, i)  # 1
-    order_date_raw, i      = take(tks, i)  # 2
-    from_site_code, i      = take(tks, i)  # 3
-    to_site_code_tmp, i    = take(tks, i)  # 4 -> parfois ce n’est pas le vrai to_site_code (si from_name contient des virgules)
+    shipment_no, i     = take(tks, i)   # 1
+    order_date_raw, i  = take(tks, i)   # 2
+    bill_to_code, i    = take(tks, i)   # 3
+    from_site_code, i  = take(tks, i)   # 4
 
-    # from_site_name: agglutine jusqu’à trouver un code numérique plausible (to_site_code)
-    parts = [to_site_code_tmp] if not is_num(to_site_code_tmp) else []
+    # from_site_name: agglutine jusqu’au prochain token numérique (= to_site_code)
+    parts = []
     while i < len(tks) and not is_num(tks[i]):
         parts.append(tks[i]); i += 1
-    if is_num(to_site_code_tmp):
-        # alors on n'en faisait pas partie
-        from_site_name = ""
-        to_site_code = to_site_code_tmp
-    else:
-        from_site_name = ",".join(p.strip() for p in parts)
-        to_site_code, i = take(tks, i)
+    from_site_name = ",".join(p.strip() for p in parts)
+
+    to_site_code, i = take(tks, i)      # numérique attendu
 
     # to_site_name: agglutine jusqu’à rencontrer une date (pickup_date)
     parts = []
@@ -83,23 +78,21 @@ def parse_line_comma(line: str) -> dict:
         parts.append(tks[i]); i += 1
     to_site_name = ",".join(p.strip() for p in parts)
 
-    pickup_date_raw, i        = take(tks, i)
-    delivery_due_date_raw, i  = take(tks, i)
-
-    price_raw, i = take(tks, i)
-    delivered_flag, i = take(tks, i)
-
-    cost1_raw, i = take(tks, i)
-    cost2_raw, i = take(tks, i)
-    cost3_raw, i = take(tks, i)
-    cost4_raw, i = take(tks, i)
-
-    _margin_placeholder, i = take(tks, i)
-    service_flag, i        = take(tks, i)
+    pickup_date_raw, i       = take(tks, i)
+    delivery_due_date_raw, i = take(tks, i)
+    price_raw, i             = take(tks, i)
+    delivered_flag, i        = take(tks, i)
+    cost1_raw, i             = take(tks, i)
+    cost2_raw, i             = take(tks, i)
+    cost3_raw, i             = take(tks, i)
+    cost4_raw, i             = take(tks, i)
+    _margin_placeholder, i   = take(tks, i)  # souvent vide/0
+    service_flag, i          = take(tks, i)
 
     return {
         "shipment_number": shipment_no,
         "order_date_raw": order_date_raw,
+        "bill_to_code": bill_to_code,
         "from_site_code": from_site_code,
         "from_site_name": from_site_name,
         "to_site_code": to_site_code,
@@ -115,17 +108,16 @@ def parse_line_comma(line: str) -> dict:
         "service_flag": service_flag,
     }
 
-# --------- pipeline principal ---------
+# ---------- main ----------
 def main():
     if not RAW.exists():
         raise FileNotFoundError(f"Introuvable: {RAW}")
 
     txt = read_text_any(RAW)
-
-    # Détection du séparateur
     first = txt.splitlines()[0] if txt else ""
+
+    # Si c'est un export TAB → lecture directe
     if "\t" in first:
-        # ------- TSV direct (le meilleur cas) -------
         df = pd.read_csv(
             io.StringIO(txt),
             sep="\t",
@@ -134,30 +126,31 @@ def main():
             header=0 if any(ch.isalpha() for ch in first) else None,
             on_bad_lines="skip",
         )
-        if df.columns.dtype == "object" and df.columns[0].startswith("Unnamed"):
-            # fallback si pas de header
+        if df.columns.dtype == "object" and str(df.columns[0]).startswith("Unnamed"):
             df = pd.read_csv(io.StringIO(txt), sep="\t", dtype=str, header=None, engine="python")
             df.columns = [f"col_{i+1}" for i in range(df.shape[1])]
     else:
-        # ------- Ancien export COMMA non-quoté -> on reconstruit -------
+        # COMMA non-quoté → reconstruction
         lines = [ln for ln in txt.splitlines() if ln.strip()]
         rows = [parse_line_comma(ln) for ln in lines]
         df = pd.DataFrame(rows)
 
-        # conversions de base
+        # conversions
         for dcol in ["order_date_raw","pickup_date_raw","delivery_due_date_raw"]:
             df[dcol.replace("_raw","")] = df[dcol].apply(parse_yyyymmdd_float)
         for c in ["price","cost1","cost2","cost3","cost4"]:
             df[c] = df[c].apply(to_float)
+        # Choix du coût par défaut (ajuste si besoin)
         df["cost"] = df["cost1"]
-        df["margin"] = (df["price"] - df["cost"]) if "price" in df and "cost" in df else None
+        df["margin"] = (df["price"] - df["cost"]).where(df["price"].notna() & df["cost"].notna())
 
     # nettoyage
     df = df.dropna(axis=1, how="all").dropna(axis=0, how="all")
 
-    # ordre de colonnes "larges" (ajuste si tu veux en rajouter)
+    # ordre conseillé
     preferred = [
         "order_date","shipment_number",
+        "bill_to_code",
         "from_site_code","from_site_name",
         "to_site_code","to_site_name",
         "pickup_date","delivery_due_date",
@@ -171,7 +164,7 @@ def main():
     df.to_csv(OUT_CSV, index=False, quoting=csv.QUOTE_MINIMAL)
     df.to_csv(OUT_TSV, index=False, sep="\t")
 
-    # master “normalisé” minimal (optionnel mais utile au GPT)
+    # master minimal (pour ton GPT/analyses)
     master = pd.DataFrame({
         "date": df.get("order_date"),
         "order_no": df.get("shipment_number"),
@@ -182,11 +175,10 @@ def main():
         "cost": pd.to_numeric(df.get("cost"), errors="coerce"),
     })
     master["margin"] = master["revenue"] - master["cost"]
-    master_out = OUTDIR / "master_minimal.csv"
-    master.to_csv(master_out, index=False)
+    master.to_csv(OUT_MIN, index=False)
 
-    print(f"✅ Export OK : {OUT_CSV}  &  {OUT_TSV}  ({df.shape[0]} lignes, {df.shape[1]} colonnes)")
-    print(f"✅ Master minimal : {master_out}  ({master.shape[1]} colonnes)")
+    print(f"✅ Export OK : {OUT_CSV} & {OUT_TSV}  ({df.shape[0]} lignes, {df.shape[1]} colonnes)")
+    print(f"✅ Master minimal : {OUT_MIN}")
 
 if __name__ == "__main__":
     main()
