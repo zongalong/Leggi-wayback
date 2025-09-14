@@ -59,7 +59,7 @@ def main():
     # write CSV propre pour Sheets/GPT
     df.to_csv(OUT_CSV, index=False)
 
-    print(f"✅ Export terminé : {OUT_CSV} ({df.shape[0]} lignes, {df.shape[1]} colonnes})")
+    print(f"✅ Export terminé : {OUT_CSV} ({df.shape[0]} lignes, {df.shape[1]} colonnes)")
     # Petit aperçu pour debug (s'affiche dans les logs Actions)
     print("Aperçu colonnes:", list(df.columns)[:20])
 
