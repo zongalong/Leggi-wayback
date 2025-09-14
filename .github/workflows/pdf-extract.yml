@@ -43,4 +43,4 @@ jobs:
           commit_message: "build: convert PDFs to TSV (tabula)"
           file_pattern: |
             data/processed/pdf_csv/*.tsv
-            data/processed/orders_master.tsv
+            data/processed/invoices_master.tsv
