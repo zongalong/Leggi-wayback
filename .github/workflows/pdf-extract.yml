@@ -1,7 +1,9 @@
 name: pdf-to-tsv
 
 on:
-  workflow_dispatch: {}   # tu peux le lancer manuellement depuis l'onglet Actions
+  # Lancer manuellement depuis l’onglet Actions
+  workflow_dispatch: {}
+  # Lancer automatiquement quand tu ajoutes/modifies des PDF
   push:
     paths:
       - "data/raw/*.pdf"
@@ -14,14 +16,22 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install deps
+      - name: Install Java (needed by tabula-py)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y default-jre
+
+      - name: Install Python deps
         run: pip install -r requirements.txt
 
       - name: Convert PDFs to TSV
@@ -30,7 +40,7 @@ jobs:
       - name: Commit converted TSVs
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "build: convert PDFs to TSV (pdfplumber)"
+          commit_message: "build: convert PDFs to TSV (tabula)"
           file_pattern: |
             data/processed/pdf_csv/*.tsv
-            data/processed/invoices_master.tsv
+            data/processed/orders_master.tsv
