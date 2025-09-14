@@ -1,0 +1,36 @@
+name: pdf-to-tsv
+
+on:
+  workflow_dispatch: {}   # tu peux le lancer manuellement depuis l'onglet Actions
+  push:
+    paths:
+      - "data/raw/*.pdf"
+      - "scripts/pdf_to_tsv.py"
+      - "requirements.txt"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Convert PDFs to TSV
+        run: python scripts/pdf_to_tsv.py
+
+      - name: Commit converted TSVs
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "build: convert PDFs to TSV (pdfplumber)"
+          file_pattern: |
+            data/processed/pdf_csv/*.tsv
+            data/processed/invoices_master.tsv
