@@ -30,7 +30,13 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y default-jre
-
+      - name: Cache pip
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pip
+          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
+          restore-keys: |
+            ${{ runner.os }}-pip-
       - name: Install Python deps
         run: pip install -r requirements.txt
 
