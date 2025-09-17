@@ -2,265 +2,248 @@
 # -*- coding: utf-8 -*-
 
 """
-Extraction PDF -> TSV robuste pour les rapports 'Activity Report'.
-- Lit tous les PDF dans data/raw/
-- Pour chaque page/table, repère la ligne d'en-têtes (Order No, Customer, Origin, Destination, Revenue, Cost, Margin),
-  coupe tout ce qui est avant, promeut la ligne comme header, puis normalise.
-- Tolère les colonnes fusionnées (Order No + Req P/U) et la colonne 'Origin Destination Revenue' ; reconstruit revenue/cost/margin.
+Robuste PDF -> TSV pour "Activity Report" (ordersYYYY.pdf)
 
-Sorties :
-- data/processed/pdf_csv/<nom>.tsv
-- data/processed/orders_master.tsv
-Dépendances : tabula-py, pandas (Java requis sur runner Actions)
+- Essaie Tabula en mode lattice et stream
+- Détecte et scinde les colonnes fusionnées "Origin Destination Revenue"
+- Nettoie "CA", virgules, espaces, lignes d'en-tête
+- Écrit 2 fichiers:
+    data/processed/pdf_csv/ordersYYYY.tsv
+    data/processed/pdf_csv/ordersYYYY_norm.tsv  (colonnes normalisées)
 """
 
-from pathlib import Path
+from __future__ import annotations
 import re
+import sys
+from pathlib import Path
 import pandas as pd
-import tabula
+
+try:
+    import tabula  # tabula-py (nécessite Java)
+except Exception as e:
+    print("❗ tabula-py n'est pas installé ou Java absent:", e)
+    sys.exit(1)
 
 RAW_DIR = Path("data/raw")
-OUT_DIR = Path("data/processed")
+OUT_DIR = Path("data/processed/pdf_csv")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
-PER_FILE = OUT_DIR / "pdf_csv"
-PER_FILE.mkdir(parents=True, exist_ok=True)
 
-MASTER = OUT_DIR / "orders_master.tsv"
+# --- utilitaires -------------------------------------------------------------
 
-# ------------------ utilitaires ------------------
-
-HEADER_KEYS = {"ORDER", "CUSTOMER", "ORIGIN", "DESTINATION"}  # revenue/cost/margin parfois sur 2e ligne
-AMOUNT_RE = r"([\d\.,]+)\s*(?:CA)?"
-
-def _norm(x: object) -> str:
-    if x is None:
-        return ""
-    s = str(x).strip()
-    s = re.sub(r"\s+", " ", s)
-    return s
-
-def _row_text(row) -> str:
-    return " ".join(_norm(v) for v in row if _norm(v))
-
-def _find_header_idx(df: pd.DataFrame) -> int | None:
-    """Repère l'index de la ligne contenant les mots-clés d'en-tête."""
-    for i in range(len(df)):
-        line = _row_text(df.iloc[i].tolist()).upper()
-        if all(k in line for k in HEADER_KEYS):
-            return i
-    return None
-
-def _to_float(x: str | None) -> float | None:
-    if not x:
-        return None
-    s = x.replace(" CA", "").replace("$", "").replace(",", "").strip()
+def _clean_money(val: str | float | int) -> float:
+    """'2,150.00 CA' -> 2150.0 ; gère None/''."""
+    if pd.isna(val):
+        return 0.0
+    s = str(val)
+    s = s.replace("CA", "").replace("$", "").replace(",", "").strip()
+    if s == "" or re.fullmatch(r"[-–—]?\s*", s):
+        return 0.0
     try:
         return float(s)
-    except:
-        return None
+    except ValueError:
+        # parfois "0.04" devient ".04"
+        m = re.search(r"(-?\d+(?:\.\d+)?)", s)
+        return float(m.group(1)) if m else 0.0
 
-def _parse_order_and_date(text: str) -> tuple[str | None, str | None]:
-    """
-    Extrait order_no (>=4 chiffres) + date dd/mm/yyyy depuis la première colonne ou concat.
-    """
-    if not text:
-        return None, None
-    m1 = re.search(r"\b(\d{4,})\b", text)
-    m2 = re.search(r"\b(\d{2}/\d{2}/\d{4})\b", text)
-    return (m1.group(1) if m1 else None, m2.group(1) if m2 else None)
-
-def _split_origin_dest(text: str) -> tuple[str | None, str | None]:
-    """
-    Scinde 'ORIGIN DESTINATION' en deux blocs se terminant par ',PR' (province/état sur 2 lettres).
-    """
-    if not text:
-        return None, None
-    # on supprime un montant collé à la fin si présent (Tabula colle parfois '... 225.00 CA')
-    text2 = re.sub(rf"\s*{AMOUNT_RE}\s*$", "", text)
-    m = re.match(r"^(.+?,[A-Z]{2})\s+(.*,[A-Z]{2})$", text2)
+def _coerce_date(s: str) -> str:
+    """'04/01/2022' -> '2022-01-04' ; renvoie tel quel si déjà normalisée."""
+    if pd.isna(s):
+        return ""
+    s = str(s).strip()
+    if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
+        return s
+    m = re.fullmatch(r"(\d{2})/(\d{2})/(\d{4})", s)  # dd/mm/yyyy
     if m:
-        return m.group(1), m.group(2)
-    return None, None
+        d, mth, y = m.groups()
+        return f"{y}-{mth}-{d}"
+    # parfois Tabula laisse "01/ 01 /2022"
+    s2 = re.sub(r"\s+", "", s)
+    m = re.fullmatch(r"(\d{2})/(\d{2})/(\d{4})", s2)
+    if m:
+        d, mth, y = m.groups()
+        return f"{y}-{mth}-{d}"
+    return s
 
-def _extract_amounts(*candidates: str) -> tuple[float | None, float | None, float | None]:
-    """
-    Cherche revenue, cost, margin dans l'ordre en scrutant les colonnes candidates (fin de ligne en priorité).
-    """
-    joined = " ".join([_norm(c) for c in candidates if c])
-    # Cherche 3 montants à la fin (revenue cost margin)
-    nums = re.findall(AMOUNT_RE, joined)
-    nums = [n for n in nums if n]  # tuples => prendre n
-    if not nums:
-        return None, None, None
-    # Heuristique : on prend les 3 DERNIERS montants de la ligne
-    nums = nums[-3:]
-    while len(nums) < 3:
-        nums.insert(0, None)
-    rev, cost, mar = (_to_float(nums[0]), _to_float(nums[1]), _to_float(nums[2]))
-    return rev, cost, mar
+FUSED_COL_PAT = re.compile(
+    r"""
+    ^\s*
+    (?P<origin>[A-ZÉÈÀÎÔÂÇ' \.-]+,[A-Z]{2})     # ex. BOUCHERVILLE,PQ
+    \s+
+    (?P<dest>[A-ZÉÈÀÎÔÂÇ' \.-]+,[A-Z]{2})       # ex. MONTREAL-NORD,PQ
+    \s+
+    (?P<rev>-?\d[\d,]*\.?\d*)                   # 225.00 ou 2,150.00
+    (?:\s*CA)?\s*$
+    """,
+    re.VERBOSE
+)
 
-def _promote_header(df: pd.DataFrame, idx: int) -> pd.DataFrame:
-    header = df.iloc[idx].astype(str).tolist()
-    cols = []
-    seen = {}
-    for h in header:
-        h1 = _norm(h).lower()
-        h1 = re.sub(r"[^a-z0-9 ]", " ", h1)
-        h1 = re.sub(r"\s+", "_", h1).strip("_") or "col"
-        if h1 in seen:
-            seen[h1] += 1
-            h1 = f"{h1}_{seen[h1]}"
-        else:
-            seen[h1] = 1
-        cols.append(h1)
-    body = df.iloc[idx+1:].reset_index(drop=True)
-    body.columns = cols[:body.shape[1]]
-    return body
+def split_fused_origin_dest_rev(cell: str) -> tuple[str, str, str] | None:
+    if not isinstance(cell, str):
+        return None
+    m = FUSED_COL_PAT.match(cell.strip())
+    if not m:
+        return None
+    return m.group("origin"), m.group("dest"), m.group("rev")
 
-# ------------------ traitement par page ------------------
+# --- extraction --------------------------------------------------------------
 
-def extract_one_pdf(pdf_path: Path) -> pd.DataFrame:
-    """
-    Lit un PDF avec Tabula (stream puis lattice).
-    Pour chaque table, coupe avant l'en-tête et normalise les colonnes de sortie :
-    order_no, req_pu_date, customer, origin, destination, revenue, cost, margin
-    """
-    out_rows = []
+def read_pdf_best(pdf_path: Path) -> pd.DataFrame:
+    """Essaie lattice puis stream, retourne le meilleur DF concaténé."""
+    dfs = []
 
-    # 1) Essai stream, puis lattice
-    dfs: list[pd.DataFrame] = []
-    try:
-        dfs += tabula.read_pdf(str(pdf_path), pages="all", multiple_tables=True, stream=True, guess=True) or []
-    except Exception:
-        pass
-    try:
-        dfs += tabula.read_pdf(str(pdf_path), pages="all", multiple_tables=True, lattice=True, guess=False) or []
-    except Exception:
-        pass
+    for mode in ("lattice", "stream"):
+        try:
+            frames = tabula.read_pdf(
+                str(pdf_path),
+                pages="all",
+                multiple_tables=True,
+                lattice=(mode == "lattice"),
+                stream=(mode == "stream"),
+                guess=True
+            )
+            # gardons seulement tables "assez larges"
+            for f in frames or []:
+                if isinstance(f, pd.DataFrame) and f.shape[1] >= 3:
+                    dfs.append((mode, f))
+        except Exception as e:
+            print(f"⚠️ Tabula {mode} a échoué: {e}")
 
-    for raw in dfs:
-        if raw is None or raw.empty:
-            continue
-        raw = raw.astype(str).applymap(_norm)
-        raw = raw.replace({"None": ""})
-        raw = raw.dropna(axis=1, how="all").dropna(axis=0, how="all")
-        if raw.empty:
-            continue
+    if not dfs:
+        raise RuntimeError(f"Aucune table extraite depuis {pdf_path}")
 
-        # 2) Repère l'en-tête dans CETTE table
-        hdr_idx = _find_header_idx(raw)
-        if hdr_idx is None:
-            # rien d'exploitable ici
-            continue
+    # Heuristique: privilégier la table avec le plus de colonnes
+    best_mode, best_df = max(dfs, key=lambda it: it[1].shape[1])
+    print(f"ℹ️  Mode retenu: {best_mode} ({best_df.shape[0]} lignes, {best_df.shape[1]} colonnes)")
 
-        tbl = _promote_header(raw, hdr_idx)
-        if tbl.empty:
-            continue
+    # Concatène toutes les tables "compatibles" en suivant le même mode choisi
+    tables = [df for m, df in dfs if m == best_mode]
+    df = pd.concat(tables, ignore_index=True)
 
-        # 3) Canonique : on crée des champs cibles à partir des colonnes présentes
-        for _, row in tbl.iterrows():
-            cells = [row.get(c, "") for c in tbl.columns]
-            line = " ".join(_norm(c) for c in cells if _norm(c))
+    return df
 
-            # a) order + date
-            order_no, req_date = _parse_order_and_date(" ".join([
-                row.get(tbl.columns[0], ""),
-                row.get(tbl.columns[1], "")
-            ]))
+def normalize_columns(df: pd.DataFrame) -> pd.DataFrame:
+    # Supprimer lignes d'en-tête / titres intermédiaires
+    def is_header_row(row: pd.Series) -> bool:
+        text = " ".join(str(x) for x in row.values if not pd.isna(x)).upper()
+        return (
+            "ACTIVITY REPORT" in text
+            or "REPORT PERIOD" in text
+            or "ORDER NO" in text
+            or "HOME CUR" in text
+        )
 
-            # b) customer
-            # on prend la 1re colonne 'customer' si elle existe, sinon la 2e/3e textuelle
-            customer = None
-            for cname in tbl.columns[:4]:
-                txt = _norm(row.get(cname, ""))
-                if "customer" in cname and txt:
-                    customer = txt
-                    break
-            if not customer:
-                # fallback : colonne 2 si non numérique
-                for cname in tbl.columns[1:3]:
-                    txt = _norm(row.get(cname, ""))
-                    if txt and not re.search(r"\d{2}/\d{2}/\d{4}", txt):
-                        customer = txt
-                        break
+    df = df[~df.apply(is_header_row, axis=1)].copy()
 
-            # c) origin / destination
-            # cherche colonne avec 'origin' ou 'destination', sinon concat des colonnes 2-4
-            od = None
-            for cname in tbl.columns:
-                if "origin" in cname or "destination" in cname:
-                    od = _norm(row.get(cname, ""))
-                    if od:
-                        break
-            if not od:
-                od = " ".join(_norm(row.get(c, "")) for c in tbl.columns[2:5])
-            origin, destination = _split_origin_dest(od)
+    # Renommer colonnes par heuristique
+    cols = [str(c).strip().lower() for c in df.columns]
 
-            # d) montants
-            # cherche explicitement les colonnes revenue/cost/margin si nommées, sinon prendre la fin de ligne
-            rev = _to_float(row.get("revenue", "")) if "revenue" in tbl.columns else None
-            cst = _to_float(row.get("cost", "")) if "cost" in tbl.columns else None
-            mar = _to_float(row.get("margin", "")) if "margin" in tbl.columns else None
-            if rev is None or cst is None or mar is None:
-                r2, c2, m2 = _extract_amounts(*cells[-4:])
-                rev = rev if rev is not None else r2
-                cst = cst if cst is not None else c2
-                mar = mar if mar is not None else m2
+    # Cas 1: colonnes attendues présentes
+    expected = ["order", "req", "customer", "origin", "destination", "revenue", "cost", "margin"]
+    # mapping heuristique
+    mapping = {}
+    for i, c in enumerate(cols):
+        if "order" in c and "no" in c:
+            mapping[df.columns[i]] = "order_no"
+        elif ("req" in c and "pu" in c) or ("pickup" in c):
+            mapping[df.columns[i]] = "req_pu_date"
+        elif "customer" in c:
+            mapping[df.columns[i]] = "customer"
+        elif "origin" in c and "destination" in c and "revenue" in c:
+            mapping[df.columns[i]] = "fused_odr"
+        elif "origin" in c:
+            mapping[df.columns[i]] = "origin"
+        elif "destination" in c:
+            mapping[df.columns[i]] = "destination"
+        elif "revenue" in c:
+            mapping[df.columns[i]] = "revenue"
+        elif "cost" in c:
+            mapping[df.columns[i]] = "cost"
+        elif "margin" in c:
+            mapping[df.columns[i]] = "margin"
 
-            # filtre lignes vides parasites (pieds de page etc.)
-            if not any([order_no, customer, origin, destination, rev, cst, mar]):
-                continue
+    df = df.rename(columns=mapping)
 
-            out_rows.append({
-                "order_no": order_no,
-                "req_pu_date": req_date,
-                "customer": customer,
-                "origin": origin,
-                "destination": destination,
-                "revenue": rev,
-                "cost": cst,
-                "margin": mar,
-            })
+    # Si colonne fusionnée détectée, scinder
+    if "fused_odr" in df.columns:
+        o, d, r = [], [], []
+        for v in df["fused_odr"].astype(str).fillna(""):
+            tri = split_fused_origin_dest_rev(v)
+            if tri:
+                oo, dd, rr = tri
+            else:
+                oo, dd, rr = "", "", ""
+            o.append(oo); d.append(dd); r.append(rr)
+        df["origin"] = df.get("origin", pd.Series(o)).replace("", pd.NA)
+        df["destination"] = df.get("destination", pd.Series(d)).replace("", pd.NA)
+        # ne pas écraser un revenue déjà séparé
+        if "revenue" not in df.columns or df["revenue"].isna().all():
+            df["revenue"] = r
+        df = df.drop(columns=["fused_odr"], errors="ignore")
 
-    return pd.DataFrame(out_rows)
+    # Garder uniquement les colonnes d'intérêt
+    keep = ["order_no", "req_pu_date", "customer", "origin", "destination", "revenue", "cost", "margin"]
+    for k in keep:
+        if k not in df.columns:
+            df[k] = pd.NA
+    df = df[keep]
 
-def save_tsv(df: pd.DataFrame, path: Path):
-    df.to_csv(path, sep="\t", index=False)
+    # Nettoyage/normalisation
+    df["order_no"] = df["order_no"].astype(str).str.extract(r"(\d+)")[0]
+    df["req_pu_date"] = df["req_pu_date"].map(_coerce_date)
+    df["customer"] = df["customer"].astype(str).str.strip()
+
+    # Certaines lignes vides héritent visuellement du client juste au-dessus → forward fill
+    df["customer"] = df["customer"].replace({"": pd.NA}).ffill()
+
+    for col in ("origin", "destination"):
+        df[col] = df[col].astype(str).str.strip()
+        # Filtrer les fusions ratées (mots collés sans province) si besoin
+        df[col] = df[col].where(df[col].str.contains(r",[A-Z]{2}$", na=False), df[col])
+
+    for col in ("revenue", "cost", "margin"):
+        df[col] = df[col].map(_clean_money).astype(float)
+
+    # Supprimer lignes clairement vides
+    mask_allna = df[["order_no","req_pu_date","customer","origin","destination"]].replace("", pd.NA).isna().all(axis=1)
+    df = df[~mask_allna].copy()
+
+    # Re-trier si l'ordre a sauté
+    with pd.option_context("future.no_silent_downcasting", True):
+        df["order_no"] = pd.to_numeric(df["order_no"], errors="coerce").astype("Int64")
+
+    return df.reset_index(drop=True)
+
+# --- pipeline principal ------------------------------------------------------
+
+def convert_one(pdf_path: Path):
+    year = re.search(r"(\d{4})", pdf_path.stem)
+    year = year.group(1) if year else "unknown"
+
+    print(f"\n📄 PDF: {pdf_path.name}")
+    raw_df = read_pdf_best(pdf_path)
+
+    # Sauvegarde brute "au cas où"
+    raw_tsv = OUT_DIR / f"{pdf_path.stem}_raw.tsv"
+    raw_df.to_csv(raw_tsv, sep="\t", index=False)
+    print(f"💾 TSV brut: {raw_tsv}")
+
+    norm_df = normalize_columns(raw_df)
+    norm_tsv = OUT_DIR / f"orders{year}.tsv"
+    norm_df.to_csv(norm_tsv, sep="\t", index=False)
+    print(f"✅ TSV normalisé: {norm_tsv} ({len(norm_df)} lignes)")
+
+    # Variante _norm pour la suite du pipeline existant
+    norm_tsv2 = OUT_DIR / f"orders{year}_norm.tsv"
+    norm_df.to_csv(norm_tsv2, sep="\t", index=False)
+    print(f"↳ Alias: {norm_tsv2}")
 
 def main():
-    pdfs = sorted([p for p in RAW_DIR.glob("*.pdf") if p.is_file()])
+    pdfs = sorted(RAW_DIR.glob("orders*.pdf"))
     if not pdfs:
-        print("Aucun PDF dans data/raw/")
+        print("Aucun PDF trouvé dans data/raw (pattern orders*.pdf).")
         return
-
-    all_df = []
-    for p in pdfs:
-        print(f"→ {p.name}")
-        df = extract_one_pdf(p)
-        if df.empty:
-            print("   (aucune table exploitable)")
-            continue
-
-        # typage & nettoyage finaux
-        df["order_no"] = df["order_no"].astype(str).str.replace(r"\.0+$", "", regex=True)
-        df["req_pu_date"] = pd.to_datetime(df["req_pu_date"], format="%d/%m/%Y", errors="coerce")
-        for col in ["revenue", "cost", "margin"]:
-            df[col] = pd.to_numeric(df[col], errors="coerce")
-
-        out_file = PER_FILE / f"{p.stem}.tsv"
-        save_tsv(df, out_file)
-        print(f"   ✔ {out_file} ({df.shape[0]} lignes, {df.shape[1]} colonnes)")
-
-        df2 = df.copy()
-        df2.insert(0, "source_pdf", p.name)
-        all_df.append(df2)
-
-    if all_df:
-        master = pd.concat(all_df, ignore_index=True)
-        save_tsv(master, MASTER)
-        print(f"✔ Master: {MASTER} ({master.shape[0]} lignes, {master.shape[1]} colonnes)")
-    else:
-        print("Aucun enregistrement consolidé; master non généré.")
+    for pdf in pdfs:
+        convert_one(pdf)
 
 if __name__ == "__main__":
     main()
