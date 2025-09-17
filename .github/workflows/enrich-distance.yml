@@ -1,12 +1,12 @@
 name: enrich-distances
 
 on:
+  workflow_dispatch: {}     # lancement manuel possible
   push:
     paths:
       - "data/processed/pdf_csv/orders*.tsv"
       - "scripts/enrich_with_distance.py"
       - "requirements.txt"
-  workflow_dispatch: {}
 
 permissions:
   contents: write
@@ -26,7 +26,7 @@ jobs:
 
       - name: Enrich TSVs with distance
         env:
-          ORS_API_KEY: ${{ secrets.ORS_API_KEY }}   # optionnel
+          ORS_API_KEY: ${{ secrets.ORS_API_KEY }}   # optionnel; fallback haversine si absent
         run: python scripts/enrich_with_distance.py
 
       - name: Commit enriched files and caches
