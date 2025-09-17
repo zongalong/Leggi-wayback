@@ -3,15 +3,10 @@ name: enrich-distances
 on:
   workflow_dispatch: {}
   push:
-    # Ne déclenche que sur les TSV "bruts" produits par Tabula
     paths:
-      - "data/processed/pdf_csv/orders*.tsv"
+      - "data/processed/pdf_csv/orders*.tsv"     # ne matche que les TSV bruts (ordersYYYY.tsv)
       - "scripts/enrich_with_distance.py"
       - "requirements.txt"
-    # Ignore les fichiers enrichis et caches
-    paths-ignore:
-      - "data/processed/pdf_csv/*_enriched.tsv"
-      - "data/processed/geo/**"
 
 permissions:
   contents: write
@@ -23,6 +18,9 @@ concurrency:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # ⛔️ Empêche le job de repartir sur les commits du bot (évite la boucle)
+    if: github.actor != 'github-actions[bot]'
+
     steps:
       - uses: actions/checkout@v4
 
@@ -35,7 +33,7 @@ jobs:
 
       - name: Enrich TSVs with distance
         env:
-          ORS_API_KEY: ${{ secrets.ORS_API_KEY }}
+          ORS_API_KEY: ${{ secrets.ORS_API_KEY }}   # optionnel
         run: python scripts/enrich_with_distance.py
 
       - name: Commit enriched files and caches
