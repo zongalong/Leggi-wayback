@@ -3,13 +3,13 @@ name: enrich-distances
 on:
   workflow_dispatch: {}
   push:
+    # Ne déclenche que sur les TSV "bruts" produits par Tabula
     paths:
-      # Ne déclenche que sur les TSV "bruts" produits par Tabula
       - "data/processed/pdf_csv/orders*.tsv"
       - "scripts/enrich_with_distance.py"
       - "requirements.txt"
+    # Ignore les fichiers enrichis et caches
     paths-ignore:
-      # Évite de se relancer quand on pousse les enrichis et les caches
       - "data/processed/pdf_csv/*_enriched.tsv"
       - "data/processed/geo/**"
 
@@ -35,7 +35,7 @@ jobs:
 
       - name: Enrich TSVs with distance
         env:
-          ORS_API_KEY: ${{ secrets.ORS_API_KEY }}   # optionnel (fallback haversine sinon)
+          ORS_API_KEY: ${{ secrets.ORS_API_KEY }}
         run: python scripts/enrich_with_distance.py
 
       - name: Commit enriched files and caches
