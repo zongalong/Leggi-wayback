@@ -1,0 +1,35 @@
+name: normalize-tsv
+
+on:
+  workflow_dispatch: {}
+  push:
+    # IMPORTANT: on ne regarde que les fichiers "ordersYYYY.tsv" (4 chiffres)
+    paths:
+      - "data/processed/pdf_csv/orders????.tsv"
+      - "scripts/normalize_tsv.py"
+      - "requirements.txt"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Normalize TSVs
+        run: python scripts/normalize_tsv.py
+
+      - name: Commit normalized TSVs
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "build: normalize pdf_csv TSVs"
+          file_pattern: "data/processed/pdf_csv/*_norm.tsv"
