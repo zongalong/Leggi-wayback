@@ -35,6 +35,4 @@ jobs:
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
           commit_message: "build: update master enriched TSVs"
-          file_pattern: |
-            data/processed/master/orders_master_enriched.tsv
-            data/processed/master/orders_*_enriched.tsv
+          file_pattern: "data/processed/master/*.tsv"
