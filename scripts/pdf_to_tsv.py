@@ -2,29 +2,27 @@
 # -*- coding: utf-8 -*-
 
 """
-PDF → TSV pour les rapports "Activity Report" (ordersYYYY.pdf)
+Extraction Orders PDF -> TSV (sans Java)
+- Tente tables pdfplumber
+- Fallback parsing texte (regex) si besoin
+Sorties : data/processed/pdf_csv/ordersYYYY.tsv
 
-- Entrée : data/raw/orders*.pdf
-- Sortie : data/processed/pdf_csv/ordersYYYY.tsv (tab-separated)
-
-Colonnes: order_no, req_pu_date (YYYY-MM-DD), customer, origin, destination, revenue, cost, margin
+Colonnes: order_no, req_pu_date, customer, origin, destination, revenue, cost, margin
 """
 
 from __future__ import annotations
 from pathlib import Path
-from typing import List, Dict, Optional, Iterable
 import re
 import sys
-from datetime import datetime
+import csv
 import pandas as pd
 import pdfplumber
 
-# ---------------------- Config ----------------------
 RAW_DIR = Path("data/raw")
 OUT_DIR = Path("data/processed/pdf_csv")
 OUT_DIR.mkdir(parents=True, exist_ok=True)
 
-# Tente d'abord l'extraction par "tables" pdfplumber, sinon regex bloc-par-bloc
+# Réglages d'extraction de tables pdfplumber (sans keep_blank_chars)
 TABLE_SETTINGS = dict(
     vertical_strategy="lines",
     horizontal_strategy="lines",
@@ -32,251 +30,291 @@ TABLE_SETTINGS = dict(
     join_tolerance=3,
     text_tolerance=3,
     intersection_tolerance=3,
-    keep_blank_chars=True,
 )
 
-# ---------------------- Utils ----------------------
+# ---- Utils ----
 
-MONEY_RE = re.compile(r"([0-9]{1,3}(?:,[0-9]{3})*(?:\.[0-9]{2})|[0-9]+\.[0-9]{2}|0|0\.00)")
-DATE_RE = re.compile(r"(\d{2}/\d{2}/\d{4})")
-ORDER_RE = re.compile(r"^\s*(\d{5,})\b")  # début de bloc
-# version "inline" (order + date) pour détecter démarreurs sur une ligne
-ORDER_DATE_INLINE_RE = re.compile(r"^\s*(?P<order>\d{5,})\s+(?:CA\s+)?(?P<date>\d{2}/\d{2}/\d{4})\b")
+MONEY_RE = re.compile(r"^\$?\s*([0-9]{1,3}(?:,[0-9]{3})*|[0-9]+)(?:\.[0-9]{2})?$")
+CLEAN_MONEY_RE = re.compile(r"[^\d\.]")
 
-CITY_RE = r"[A-Z' \-\.\&/]+?,[A-Z]{2}"
-# pattern complet (ligne compactée)
-FULL_ROW_PATTERNS = [
-    re.compile(
-        rf"(?P<order>\d{{5,}})\s+(?:CA\s+)?(?P<date>\d{{2}}/\d{{2}}/\d{{4}})\s+"
-        rf"(?P<customer>[A-Z0-9 \-\.'&/]+?)\s+"
-        rf"(?P<origin>{CITY_RE})\s+(?P<dest>{CITY_RE})\s+"
-        rf"(?P<rev>{MONEY_RE.pattern})(?:\s*CA)?\s+(?P<cost>{MONEY_RE.pattern})\s+(?P<margin>{MONEY_RE.pattern})"
-    ),
-    # Variante : chiffres sans cost/margin (rare)
-    re.compile(
-        rf"(?P<order>\d{{5,}})\s+(?:CA\s+)?(?P<date>\d{{2}}/\d{{2}}/\d{{4}})\s+"
-        rf"(?P<customer>[A-Z0-9 \-\.'&/]+?)\s+"
-        rf"(?P<origin>{CITY_RE})\s+(?P<dest>{CITY_RE})\s+"
-        rf"(?P<rev>{MONEY_RE.pattern})(?:\s*CA)?"
-    ),
-]
+HDR_RE = re.compile(r"\bOrder\s+No\b", re.I)
 
-def clean_money(x: Optional[str]) -> float:
+LINE_RE = re.compile(
+    r"""
+    (?P<order>\d{5})\s+
+    (?P<date>\d{2}/\d{2}/\d{4})\s+
+    (?P<customer>.*?)\s+
+    (?P<origin>[A-Z0-9\'\-\.\s,]+,[A-Z]{2})\s+
+    (?P<dest>[A-Z0-9\'\-\.\s,]+,[A-Z]{2})\s+
+    (?P<rev>\d{1,3}(?:,\d{3})*\.\d{2})\s*(?:CA|\$)?\s+
+    (?P<cost>\d{1,3}(?:,\d{3})*\.\d{2})\s*(?:CA|\$)?\s+
+    (?P<margin>\d{1,3}(?:,\d{3})*\.\d{2})
+    """,
+    re.X,
+)
+
+def clean_money(x: str | float | int) -> float:
     if x is None:
         return 0.0
-    s = x.replace("CA", "").replace(",", "").strip()
+    if isinstance(x, (int, float)):
+        return float(x)
+    s = str(x).strip()
+    if not s:
+        return 0.0
+    s = s.replace("CA", "").replace("$", "")
+    s = s.replace("O", "0")  # sécurité OCR
+    s = s.replace(" ", "")
+    s = s.replace(",", "")
     try:
         return float(s)
     except Exception:
         return 0.0
 
-def to_iso(date_str: str) -> str:
-    # format PDF : DD/MM/YYYY
+def normalize_date(d: str) -> str:
+    d = (d or "").strip()
+    # dd/mm/yyyy -> yyyy-mm-dd
+    m = re.match(r"(\d{2})/(\d{2})/(\d{4})", d)
+    if m:
+        dd, mm, yyyy = m.groups()
+        return f"{yyyy}-{mm}-{dd}"
+    return d  # au pire on laisse
+
+def is_header_line(text: str) -> bool:
+    return bool(HDR_RE.search(text))
+
+def collapse_spaces(s: str) -> str:
+    return re.sub(r"\s+", " ", s).strip()
+
+# ---- Extraction par tables ----
+
+def tables_to_rows(page: pdfplumber.page.Page) -> list[list[str]]:
+    rows: list[list[str]] = []
     try:
-        return datetime.strptime(date_str, "%d/%m/%Y").strftime("%Y-%m-%d")
+        tables = page.extract_tables(TABLE_SETTINGS) or []
     except Exception:
-        return ""
-
-def is_header_row(cells: Iterable[str]) -> bool:
-    row = " ".join(cells).upper()
-    return ("ORDER" in row and "CUSTOMER" in row) or ("BY REQUESTED PICKUP DATE" in row)
-
-# ------------------ Extraction par tables ------------------
-
-def try_tables(page: pdfplumber.page.Page) -> List[Dict[str, str]]:
-    tables = page.extract_tables(TABLE_SETTINGS) or []
-    rows: List[Dict[str, str]] = []
-
+        tables = []
     for t in tables:
-        # normalise largeur de table
-        # on s'attend à quelque chose proche de 7-9 colonnes
-        for raw in t:
-            cells = [(c or "").strip() for c in raw]
-            # ignore lignes vides et entêtes
-            if not any(cells):
+        for raw_row in t:
+            if not raw_row:
                 continue
-            if is_header_row(cells):
+            # Nettoyage des cellules
+            row = [collapse_spaces((cell or "").replace("\n", " ")) for cell in raw_row]
+            # Ignore les lignes d’en-tête de tableau
+            joined = " ".join(row).lower()
+            if "order no" in joined and "customer" in joined and "origin" in joined:
                 continue
-
-            # Heuristique : essaye de repérer inline "order + date"
-            joined = " ".join(cells)
-            m_inline = ORDER_DATE_INLINE_RE.search(joined)
-            if not m_inline:
-                # pas une ligne de data plausible
-                continue
-
-            # Map souple : on essaie d’aligner sur 8 colonnes cibles
-            # Beaucoup de PDF donne un split en : [order+date, customer, origin, destination, revenue, cost, margin]
-            # donc on rebâtit à partir de "joined" si besoin.
-            parsed = parse_block(joined)
-            if parsed:
-                rows.append(parsed)
-
+            rows.append(row)
     return rows
 
-# ------------------ Extraction par blocs/regex ------------------
-
-def blockify(lines: List[str]) -> List[List[str]]:
-    """Découpe des lignes textuelles en blocs commençant par un order_no."""
-    blocks: List[List[str]] = []
-    cur: List[str] = []
-    for ln in lines:
-        if ORDER_RE.match(ln):
-            # démarre un nouveau bloc
-            if cur:
-                blocks.append(cur)
-            cur = [ln]
-        else:
-            if cur:
-                cur.append(ln)
-    if cur:
-        blocks.append(cur)
-    return blocks
-
-def parse_block(block_text: str) -> Optional[Dict[str, str]]:
-    # Essaie plusieurs patterns complets
-    for pat in FULL_ROW_PATTERNS:
-        m = pat.search(block_text)
-        if m:
-            d = m.groupdict()
-            order_no = d.get("order", "").strip()
-            date_iso = to_iso(d.get("date", "").strip())
-            customer = (d.get("customer") or "").strip()
-            origin = (d.get("origin") or "").strip()
-            dest = (d.get("dest") or "").strip()
-            rev = clean_money(d.get("rev"))
-            cost = clean_money(d.get("cost"))
-            margin = clean_money(d.get("margin"))
-
-            # si cost/margin absents dans ce pattern
-            if "cost" not in d:
-                cost = 0.0
-            if "margin" not in d:
-                margin = round(rev - cost, 2)
-
-            return {
-                "order_no": order_no,
-                "req_pu_date": date_iso,
-                "customer": customer,
-                "origin": origin,
-                "destination": dest,
-                "revenue": rev,
-                "cost": cost,
-                "margin": margin,
-            }
-
-    # Plan B minimaliste : on essaie de recoller depuis tokens
-    # 1) order/date
-    mhead = ORDER_DATE_INLINE_RE.search(block_text)
-    if not mhead:
+def map_row_from_table(row: list[str]) -> dict | None:
+    """
+    On tente de reconnaître l’ordre des colonnes dans une ligne extraite en table.
+    Plusieurs PDF collent "revenue cost margin" dans une seule cellule; on gère ce cas.
+    """
+    if not row:
         return None
-    order_no = mhead.group("order")
-    date_iso = to_iso(mhead.group("date"))
-    tail = block_text[mhead.end():].strip()
+    # prio: trouver le numéro d’ordre & date
+    joined = " ".join(row)
+    m_order = re.search(r"\b(\d{5})\b", joined)
+    m_date = re.search(r"\b(\d{2}/\d{2}/\d{4})\b", joined)
+    order = m_order.group(1) if m_order else None
+    date = normalize_date(m_date.group(1)) if m_date else ""
 
-    # 2) money en fin (3 montants)
-    money = MONEY_RE.findall(tail)
-    rev = cost = margin = 0.0
-    if money:
-        # on prend les 3 derniers s’ils existent
-        last3 = money[-3:]
-        if len(last3) == 3:
-            rev, cost, margin = [clean_money(x) for x in last3]
-        elif len(last3) == 2:
-            rev, cost = [clean_money(x) for x in last3]
-            margin = round(rev - cost, 2)
-        elif len(last3) == 1:
-            rev = clean_money(last3[0])
-            margin = rev
+    # Heuristique: si on a >=6 cellules, on suppose
+    # [order, date, customer, origin, dest, revenue, cost, margin] en séquence,
+    # avec parfois [revenue cost margin] collés.
+    cells = [c for c in row if c]
+    if len(cells) >= 6 and order and date:
+        # tente de localiser origin / dest: pattern "...,XX"
+        def first_city_idx(start=0):
+            for i in range(start, len(cells)):
+                if re.search(r",[A-Z]{2}$", cells[i]):
+                    return i
+            return -1
 
-    # 3) origin/destination (2 villes)
-    city_matches = re.findall(CITY_RE, tail)
-    origin = city_matches[0].strip() if len(city_matches) >= 1 else ""
-    dest = city_matches[1].strip() if len(city_matches) >= 2 else ""
+        cust_start = 0
+        # place probable du customer: après l'order et date
+        # cherche l'index de la date pour couper
+        if m_date:
+            # sépare avant/après la date dans la séquence jointe
+            pass
 
-    # 4) customer : ce qu’il y a entre la date et la 1ère ville
-    customer = ""
-    if origin:
-        before_origin = tail.split(origin, 1)[0]
-        # nettoie espaces / doubles
-        customer = re.sub(r"\s{2,}", " ", before_origin).strip()
-        # parfois le customer finit par des bouts de villes coupées → coupe aux majuscules+virgule pattern
-        customer = re.sub(r",\s*[A-Z]{2}.*$", "", customer).strip()
+        # Stratégie simple: on scanne pour trouver origin puis dest
+        oi = first_city_idx(0)
+        di = first_city_idx(oi + 1) if oi >= 0 else -1
 
-    return {
-        "order_no": order_no,
-        "req_pu_date": date_iso,
-        "customer": customer,
-        "origin": origin,
-        "destination": dest,
-        "revenue": rev,
-        "cost": cost,
-        "margin": margin,
-    }
+        origin = cells[oi] if oi >= 0 else ""
+        dest = cells[di] if di >= 0 else ""
 
-def try_blocks(page: pdfplumber.page.Page) -> List[Dict[str, str]]:
+        # customer = tout ce qui est entre la date (qu'on ignore dans cells) et origin
+        # On reconstruit en prenant tout avant origin qui ne ressemble pas à date/order
+        # Simplification: customer = cellules avant le premier ",XX"
+        customer_parts = []
+        for c in cells:
+            if c == origin:
+                break
+            # saute order/date si identiques
+            if c == order or c == re.sub("-", "/", date):
+                continue
+            # ignore rubriques genre "CA"
+            customer_parts.append(c)
+        customer = collapse_spaces(" ".join(customer_parts))
+
+        # Récup valeurs financières : on regarde les dernières valeurs numériques
+        tail = cells[-3:]
+        nums = []
+        for c in tail:
+            # si c est "rev cost margin" collés : découpe
+            found = re.findall(r"\d{1,3}(?:,\d{3})*\.\d{2}", c)
+            if found:
+                nums.extend(found)
+        if len(nums) < 3:
+            # essaie en scannant toutes les cells de droite à gauche
+            for c in reversed(cells):
+                found = re.findall(r"\d{1,3}(?:,\d{3})*\.\d{2}", c)
+                for f in reversed(found):
+                    nums.append(f)
+                if len(nums) >= 3:
+                    break
+        nums = nums[-3:] if nums else ["0.00", "0.00", "0.00"]
+        rev, cost, margin = (clean_money(n) for n in nums)
+
+        # sanity minimal
+        if order and customer and (origin or dest):
+            return dict(
+                order_no=order,
+                req_pu_date=date,
+                customer=customer,
+                origin=origin,
+                destination=dest,
+                revenue=rev,
+                cost=cost,
+                margin=margin,
+            )
+    return None
+
+# ---- Extraction en mode texte (fallback) ----
+
+def text_blocks_after_header(page: pdfplumber.page.Page) -> list[str]:
     txt = page.extract_text() or ""
-    # supprime l’en-tête / pied de page si présent
-    lines = [ln.rstrip() for ln in txt.splitlines() if ln.strip()]
-    # élimine les lignes d’entête évidentes
-    lines = [ln for ln in lines if "Activity Report" not in ln and "Report Period" not in ln]
-    lines = [ln for ln in lines if not re.search(r"----\s*Home Cur\s*----", ln)]
+    if not txt.strip():
+        return []
+    lines = [collapse_spaces(x) for x in txt.splitlines()]
+    # coupe avant/à partir de l’en-tête
+    start = 0
+    for i, line in enumerate(lines):
+        if is_header_line(line):
+            start = i + 1
+            break
+    return lines[start:]
 
-    blocks = blockify(lines)
-    out: List[Dict[str, str]] = []
-    for b in blocks:
-        block_text = " ".join(b)
-        parsed = parse_block(block_text)
-        if parsed:
-            out.append(parsed)
+
+def parse_lines_to_rows(lines: list[str]) -> list[dict]:
+    """
+    Assemble les lignes et applique la regex de détail.
+    Certaines PDF coupent les colonnes en plusieurs lignes; on recolle 2-3 lignes.
+    """
+    out: list[dict] = []
+    buf: list[str] = []
+    def try_flush():
+        joined = " ".join(buf)
+        m = LINE_RE.search(joined)
+        if m:
+            out.append(dict(
+                order_no=m.group("order"),
+                req_pu_date=normalize_date(m.group("date")),
+                customer=collapse_spaces(m.group("customer")),
+                origin=collapse_spaces(m.group("origin")),
+                destination=collapse_spaces(m.group("dest")),
+                revenue=clean_money(m.group("rev")),
+                cost=clean_money(m.group("cost")),
+                margin=clean_money(m.group("margin")),
+            ))
+            return True
+        return False
+
+    for ln in lines:
+        if not ln:
+            continue
+        buf.append(ln)
+        # essaie avec 1, 2, 3 lignes concaténées
+        if try_flush():
+            buf.clear()
+            continue
+        if len(buf) > 3:
+            # si on n’a pas matché au bout de 4 lignes, on pop la plus vieille
+            buf.pop(0)
+    # flush final
+    try_flush()
     return out
 
-# ---------------------- Orchestrateur ----------------------
+# ---- Pipeline par page ----
+
+def extract_page_records(page: pdfplumber.page.Page) -> list[dict]:
+    # 1) tente via tables
+    table_rows = tables_to_rows(page)
+    mapped: list[dict] = []
+    for r in table_rows:
+        m = map_row_from_table(r)
+        if m:
+            mapped.append(m)
+    if mapped:
+        return mapped
+
+    # 2) fallback : texte
+    lines = text_blocks_after_header(page)
+    if not lines:
+        return []
+    return parse_lines_to_rows(lines)
+
+# ---- Fichier entier ----
 
 def process_pdf(pdf_path: Path) -> pd.DataFrame:
-    rows: List[Dict[str, str]] = []
+    all_rows: list[dict] = []
     with pdfplumber.open(pdf_path) as pdf:
-        for page in pdf.pages:
-            # 1) essai “tables”
-            page_rows = try_tables(page)
-            if not page_rows:
-                # 2) fallback par blocs / regex
-                page_rows = try_blocks(page)
-            rows.extend(page_rows)
+        for pi, page in enumerate(pdf.pages, start=1):
+            recs = extract_page_records(page)
+            all_rows.extend(recs)
 
-    if not rows:
-        return pd.DataFrame(columns=["order_no","req_pu_date","customer","origin","destination","revenue","cost","margin"])
-
-    df = pd.DataFrame(rows)
+    df = pd.DataFrame(all_rows, columns=[
+        "order_no", "req_pu_date", "customer", "origin",
+        "destination", "revenue", "cost", "margin"
+    ])
 
     # Nettoyage final
-    # garde uniquement les lignes plausibles (order_no, date, au moins revenue)
-    df = df[df["order_no"].astype(str).str.fullmatch(r"\d{5,}", na=False)]
-    df = df[df["req_pu_date"].astype(str).str.len() == 10]
+    df = df.dropna(how="all")
+    # filtre évidences fausses : order_no doit être 5 chiffres
+    df = df[df["order_no"].astype(str).str.fullmatch(r"\d{5}", na=False)]
+    # dates normalisées
+    df["req_pu_date"] = df["req_pu_date"].astype(str)
 
-    # types
-    for col in ["revenue", "cost", "margin"]:
-        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+    # types numériques
+    for c in ["revenue", "cost", "margin"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce").fillna(0.0)
 
-    # supprime doublons évidents
-    df = df.drop_duplicates(subset=["order_no", "req_pu_date", "customer", "origin", "destination"])
+    return df.reset_index(drop=True)
 
-    # tri par date puis order
-    df = df.sort_values(["req_pu_date", "order_no"]).reset_index(drop=True)
-    return df
+# ---- Main ----
 
 def main():
     pdfs = sorted(RAW_DIR.glob("orders*.pdf"))
     if not pdfs:
-        print(f"⚠️ Aucun PDF trouvé dans {RAW_DIR}")
+        print("⚠️  Aucun PDF trouvé dans data/raw (pattern orders*.pdf)")
         sys.exit(0)
 
     for pdf_path in pdfs:
+        year = re.search(r"(\d{4})", pdf_path.stem)
+        y = year.group(1) if year else "unknown"
         print(f"📄 {pdf_path.name} → extraction…")
-        df = process_pdf(pdf_path)
-        out_tsv = OUT_DIR / f"{pdf_path.stem}.tsv"
-        df.to_csv(out_tsv, sep="\t", index=False)
-        print(f"✅ {out_tsv} ({len(df)} lignes)")
+        try:
+            df = process_pdf(pdf_path)
+        except Exception as e:
+            print(f"❌ Échec {pdf_path.name}: {e}")
+            continue
+
+        out_path = OUT_DIR / f"orders{y}.tsv"
+        df.to_csv(out_path, sep="\t", index=False, quoting=csv.QUOTE_MINIMAL)
+        print(f"✅ {out_path} ({len(df)} lignes)")
 
 if __name__ == "__main__":
     main()
