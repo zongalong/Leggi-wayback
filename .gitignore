@@ -1,0 +1,57 @@
+# ==============================
+# Python
+# ==============================
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.pkl
+*.egg-info/
+*.egg
+*.log
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+.Python
+
+# Jupyter / IPython
+.ipynb_checkpoints/
+*.ipynb_convert/
+
+# ==============================
+# OS files
+# ==============================
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# ==============================
+# IDE / Editor
+# ==============================
+.vscode/
+.idea/
+*.swp
+
+# ==============================
+# Build / Dist
+# ==============================
+build/
+dist/
+*.tar.gz
+*.whl
+
+# ==============================
+# Data (raw temporaires ignorés)
+# ==============================
+data/raw/*
+data/processed/pdf_csv/*
+data/processed/geo/*
+
+# ==============================
+# Exceptions (ne PAS ignorer ces fichiers)
+# ==============================
+!data/processed/pdf_csv/*_enriched.tsv
+!data/processed/master/*.tsv
