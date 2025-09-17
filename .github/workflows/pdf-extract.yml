@@ -1,9 +1,7 @@
 name: pdf-to-tsv
 
 on:
-  # Lancer manuellement depuis l’onglet Actions
-  workflow_dispatch: {}
-  # Lancer automatiquement quand tu ajoutes/modifies des PDF
+  workflow_dispatch: {}     # lancement manuel possible
   push:
     paths:
       - "data/raw/*.pdf"
@@ -30,13 +28,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y default-jre
-      - name: Cache pip
-        uses: actions/cache@v4
-        with:
-          path: ~/.cache/pip
-          key: ${{ runner.os }}-pip-${{ hashFiles('requirements.txt') }}
-          restore-keys: |
-            ${{ runner.os }}-pip-
+
       - name: Install Python deps
         run: pip install -r requirements.txt
 
@@ -49,4 +41,4 @@ jobs:
           commit_message: "build: convert PDFs to TSV (tabula)"
           file_pattern: |
             data/processed/pdf_csv/*.tsv
-            data/processed/invoices_master.tsv
+            data/processed/orders_master.tsv
