@@ -1,11 +1,12 @@
 name: normalize-tsv
 
 on:
+  # Lancer manuellement au besoin
   workflow_dispatch: {}
+  # Lancer automatiquement quand un TSV brut est ajouté/modifié
   push:
-    # IMPORTANT: on ne regarde que les fichiers "ordersYYYY.tsv" (4 chiffres)
     paths:
-      - "data/processed/pdf_csv/orders????.tsv"
+      - "data/processed/pdf_csv/*.tsv"
       - "scripts/normalize_tsv.py"
       - "requirements.txt"
 
@@ -15,10 +16,13 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
