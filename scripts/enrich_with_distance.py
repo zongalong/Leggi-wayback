@@ -12,16 +12,15 @@ GEO_DIR.mkdir(parents=True, exist_ok=True)
 LOC_CACHE = GEO_DIR / "locations.csv"   # location, norm, lat, lon, country
 DIST_CACHE = GEO_DIR / "distances.csv"  # origin_norm, dest_norm, distance_km, method
 
-ORS_API_KEY = os.getenv("ORS_API_KEY")  # (optionnel) clé OpenRouteService
+ORS_API_KEY = os.getenv("ORS_API_KEY")  # (optionnel) OpenRouteService
 ORS_URL = "https://api.openrouteservice.org/v2/directions/driving-car"
 
-# Provinces/États -> pays (inclut PQ->QC)
 PROV_STATE_TO_COUNTRY = {
     # Canada
     "AB":"Canada","BC":"Canada","MB":"Canada","NB":"Canada","NL":"Canada","NS":"Canada",
     "NT":"Canada","NU":"Canada","ON":"Canada","PE":"Canada","QC":"Canada","SK":"Canada","YT":"Canada",
-    "PQ":"Canada",  # ancien code -> QC
-    # USA (courants)
+    "PQ":"Canada",
+    # USA
     "AL":"USA","AK":"USA","AZ":"USA","AR":"USA","CA":"USA","CO":"USA","CT":"USA","DE":"USA","FL":"USA",
     "GA":"USA","HI":"USA","ID":"USA","IL":"USA","IN":"USA","IA":"USA","KS":"USA","KY":"USA","LA":"USA",
     "ME":"USA","MD":"USA","MA":"USA","MI":"USA","MN":"USA","MS":"USA","MO":"USA","MT":"USA","NE":"USA",
@@ -31,7 +30,6 @@ PROV_STATE_TO_COUNTRY = {
 }
 
 def normalize_loc(raw: str):
-    """'MONTREAL-NORD,PQ' -> dict with norm 'montreal-nord,qc,canada'"""
     if not isinstance(raw, str) or not raw.strip():
         return {"norm":"", "city":"", "region":"", "country":""}
     txt = unidecode(raw.strip())
@@ -40,7 +38,7 @@ def normalize_loc(raw: str):
         city = txt
         return {"norm": city.lower(), "city": city.lower(), "region":"", "country":""}
     city, code = m.group(1).strip(), m.group(2).upper()
-    if code == "PQ":  # ancien code Québec
+    if code == "PQ":
         code = "QC"
     country = PROV_STATE_TO_COUNTRY.get(code, "")
     norm = f"{city},{code}".lower()
@@ -58,7 +56,6 @@ def save_csv(df, path, subset):
     df.to_csv(path, index=False)
 
 def geocode(norm: str, country_hint: str, session: requests.Session):
-    # 1) OpenRouteService geocode (si API key présente)
     if ORS_API_KEY:
         url = "https://api.openrouteservice.org/geocode/search"
         params = {"api_key": ORS_API_KEY, "text": norm}
@@ -71,7 +68,6 @@ def geocode(norm: str, country_hint: str, session: requests.Session):
             if feats:
                 lon, lat = feats[0]["geometry"]["coordinates"]
                 return (float(lat), float(lon))
-    # 2) Fallback Nominatim (public)
     url = "https://nominatim.openstreetmap.org/search"
     params = {"q": norm, "format":"json", "limit":1}
     r = session.get(url, params=params, headers={"User-Agent":"leggi-distance/1.0"}, timeout=20)
@@ -135,11 +131,12 @@ def pair_distance(origin, dest, loc_cache, dist_cache, session):
     return dist_km, loc_cache, dist_cache
 
 def enrich_file(tsv_path: Path):
+    # Lecture TSV brut
     df = pd.read_csv(tsv_path, sep="\t", dtype={"order_no":str}, keep_default_na=False)
-    req = ["order_no","req_pu_date","customer","origin","destination","revenue","cost","margin"]
-    missing = [c for c in req if c not in df.columns]
+    required = ["order_no","req_pu_date","customer","origin","destination","revenue","cost","margin"]
+    missing = [c for c in required if c not in df.columns]
     if missing:
-        raise ValueError(f"{tsv_path.name}: colonnes manquantes {missing}")
+        raise ValueError(f"{tsv_path.name}: colonnes manquantes {missing}\nColonnes lues: {list(df.columns)}")
 
     loc_cache = load_csv(LOC_CACHE, ["location","norm","lat","lon","country"])
     dist_cache = load_csv(DIST_CACHE, ["origin_norm","dest_norm","distance_km","method"])
@@ -149,8 +146,7 @@ def enrich_file(tsv_path: Path):
     for _, row in df.iterrows():
         o, d = row.get("origin","").strip(), row.get("destination","").strip()
         if not o or not d:
-            distances.append(math.nan)
-            continue
+            distances.append(math.nan); continue
         dkm, loc_cache, dist_cache = pair_distance(o, d, loc_cache, dist_cache, session)
         distances.append(dkm if dkm is not None else math.nan)
 
@@ -176,11 +172,13 @@ def enrich_file(tsv_path: Path):
     print(f"✅ Enrichi: {tsv_path.name} → {out.name} ({df.shape[0]} lignes)")
 
 def main():
-    files = sorted(RAW_DIR.glob("orders20*.tsv"))
+    # Ne traiter que les TSV "bruts", pas les *_enriched.tsv
+    files = sorted([p for p in RAW_DIR.glob("orders*.tsv") if not p.name.endswith("_enriched.tsv")])
     if not files:
-        print("Aucun TSV dans data/processed/pdf_csv/")
+        print("Aucun TSV brut dans data/processed/pdf_csv/")
         return
     for f in files:
+        print(f"▶ Traitement {f.name}")
         enrich_file(f)
 
 if __name__ == "__main__":
