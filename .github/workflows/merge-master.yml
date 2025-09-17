@@ -1,0 +1,40 @@
+name: merge-master
+
+on:
+  # Lancer à la main au besoin
+  workflow_dispatch: {}
+  # Lancer dès qu'un enriched est ajouté/modifié
+  push:
+    paths:
+      - "data/processed/pdf_csv/*_enriched.tsv"
+      - "scripts/merge_enriched.py"
+      - "requirements.txt"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Merge enriched TSVs into master
+        run: python scripts/merge_enriched.py
+
+      - name: Commit master files
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "build: update master enriched TSVs"
+          file_pattern: |
+            data/processed/master/orders_master_enriched.tsv
+            data/processed/master/orders_*_enriched.tsv
