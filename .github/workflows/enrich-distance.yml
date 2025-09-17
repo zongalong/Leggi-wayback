@@ -1,26 +1,19 @@
-name: enrich-distances
+name: enrich-distance
 
 on:
   workflow_dispatch: {}
   push:
     paths:
-      - "data/processed/pdf_csv/orders*.tsv"     # ne matche que les TSV bruts (ordersYYYY.tsv)
+      - "data/processed/pdf_csv/*_norm.tsv"
       - "scripts/enrich_with_distance.py"
       - "requirements.txt"
 
 permissions:
   contents: write
 
-concurrency:
-  group: enrich-distances
-  cancel-in-progress: true
-
 jobs:
   build:
     runs-on: ubuntu-latest
-    # ⛔️ Empêche le job de repartir sur les commits du bot (évite la boucle)
-    if: github.actor != 'github-actions[bot]'
-
     steps:
       - uses: actions/checkout@v4
 
@@ -39,7 +32,7 @@ jobs:
       - name: Commit enriched files and caches
         uses: stefanzweifel/git-auto-commit-action@v5
         with:
-          commit_message: "build: enrich orders with distance and km metrics"
+          commit_message: "build: enrich orders with distance"
           file_pattern: |
             data/processed/pdf_csv/*_enriched.tsv
             data/processed/geo/*.csv
