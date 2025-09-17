@@ -1,0 +1,38 @@
+name: enrich-distances
+
+on:
+  push:
+    paths:
+      - "data/processed/pdf_csv/orders*.tsv"
+      - "scripts/enrich_with_distance.py"
+      - "requirements.txt"
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: pip install -r requirements.txt
+
+      - name: Enrich TSVs with distance
+        env:
+          ORS_API_KEY: ${{ secrets.ORS_API_KEY }}   # optionnel
+        run: python scripts/enrich_with_distance.py
+
+      - name: Commit enriched files and caches
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "build: enrich orders with distance and km metrics"
+          file_pattern: |
+            data/processed/pdf_csv/*_enriched.tsv
+            data/processed/geo/*.csv
